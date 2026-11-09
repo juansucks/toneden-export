@@ -64,7 +64,7 @@ python toneden_export.py export.json --token-map '{"2420976": "s%3A...", "123": 
 ## Usage
 
 ```
-python toneden_export.py ToneDen_Privacy_Data.json -o out/ -v
+python toneden_export.py "ToneDen Privacy Data.json" -o out/ -v
 ```
 
 | Option | Description |
