@@ -64,7 +64,7 @@ python toneden_export.py export.json --token-map '{"2420976": "s%3A...", "123": 
 ## Usage
 
 ```
-python toneden_export.py "ToneDen Privacy Data.json" -o out/ -v
+python toneden_export.py ToneDen_Privacy_Data.json -o out/ -v
 ```
 
 | Option | Description |
@@ -76,7 +76,9 @@ python toneden_export.py "ToneDen Privacy Data.json" -o out/ -v
 | `--only UID` | Process only this user ID (repeatable). |
 | `--playbook-id ID` | Fetch a playbook campaign (repeatable). Playbook IDs cannot be derived from the export. |
 | `--link-metrics a,b,c` | `metric` values to try on `/links/{id}/insights` (default `clicks,clickthroughs,email_clicks,rsvps`). |
-| `--no-unlock-assets` | Don't download assets of campaigns you unlocked. Their post and gateMetadata JSON is still saved. |
+| `--no-unlock-assets` | Don't download assets or write link shortcuts for campaigns you unlocked. Their post and gateMetadata JSON is still saved. |
+| `--unlock-links MODE` | Link shortcut for each unlocked campaign's download target. `fallback` (default): only when it can't be saved as a file (it is an HTML page, or the request fails). `always`: also next to files that were saved. `never`: none. |
+| `--link-format FMT` | Shortcut type: `url` (default, an Internet Shortcut file) or `txt` (the URL as text). |
 | `--no-fans` | Skip the audience fan lists. |
 | `--no-download` | API JSON only, no file downloads. |
 | `--workers N` | Parallel downloads (default 8). |
@@ -107,7 +109,16 @@ out/
     campaigns/<id>/<file>
     account/<uid>/<file>
     unlocked/<poster>/<unlock id>/<file>   other creators' campaigns you unlocked
+    unlocked/<poster>/<unlock id>/<name>.url|.txt   link shortcut, see below
 ```
+
+Unlocked campaign links:
+
+- The download target is `metadata.download_url` from gateMetadata. For link-type unlocks whose gate is open and which have no `download_url`, the post's `direct_url` is used instead.
+- An HTML page is never saved as the file, even if the name or URL claims an extension. If the target can't be saved as a file (HTML page such as a share link, HTTP error, page host), a shortcut is written where the file would be: `<download_display_url without extension>.url` (or `.txt`), falling back to the post's `link_path` when there is no display name.
+- With `--unlock-links always` the shortcut is written even when the file was saved, so both are present (`Track.wav` and `Track.url`). A shortcut from an earlier run is removed when it is no longer wanted.
+- The URL in the shortcut is whatever the API returned. Direct download URLs may be signed and expire, so don't rely on a saved one for long.
+- `--no-download` and `--no-unlock-assets` also suppress shortcuts.
 
 File naming:
 
@@ -134,6 +145,7 @@ Unofficial (found via the site, may change or reject OAuth): `/attachments/{id}/
 - The per-attachment fan filter for contests (`contest_entered`) and `offset`/`limit` pagination on the fans endpoint are unverified. If the server ignores pagination, only the first page is saved.
 - Playbook IDs aren't in the export; pass them with `--playbook-id`.
 - Private posts with a secret token in the URL aren't handled.
+- Using `direct_url` for link-type unlocks is an assumption about the API's fields; it is only used when the gate is open and `download_url` is missing.
 - Facebook ad video creatives only expose a `video_id`, so those videos can't be downloaded.
 - Comments, submissions, follows and the other activity sections have no API endpoints; they remain only in `export.json`.
 - Fan lists contain other people's personal data. Treat that output accordingly.
