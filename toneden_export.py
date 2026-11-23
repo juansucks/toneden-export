@@ -21,6 +21,9 @@ Output:
         assets/attachments/12345/art.png       assets/links/678/bg.jpg
         assets/account/<uid>/avatar.jpg        assets/unlocked/<user>/<unlock id>/<download_display_url>
       (unlocked = other creators' campaigns this account unlocked, kept apart from own attachments)
+      Unlocked campaigns whose download target isn't a file (HTML page, error) get a link shortcut
+      (<name>.url or .txt, see --unlock-links / --link-format) in the same folder; "always" also
+      adds one next to saved files.
       kind = attachments | links | campaigns | unlocked | account. A URL used by several owners is stored once
       per owner (hardlink, else copy). Extension comes from the name, else magic bytes, else
       Content-Type, else the URL. Which API response/export section held each URL (origin) and
@@ -452,7 +455,10 @@ def fetch_asset(url, info, out, placer, prior):
                 if r.status_code != 200:
                     return {**base, "status": r.status_code, "files": []}
                 ct = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if not info["strong"] and ct in ("text/html", "application/xhtml+xml"):
+                # an HTML page is never the file, even if the name/URL claims an extension
+                html_ok = any(Path(x or "").suffix.lower() in (".html", ".htm")
+                              for x in (info["hint"], unquote(urlsplit(url).path)))
+                if not html_ok and ct in ("text/html", "application/xhtml+xml"):
                     vlog(f"skip (html) {url} <- {src}")
                     return {**base, "status": "skipped-html", "files": []}
                 dirs[0].mkdir(parents=True, exist_ok=True)
@@ -463,6 +469,10 @@ def fetch_asset(url, info, out, placer, prior):
                         f.write(chunk)
                         sha.update(chunk)
                         size += len(chunk)
+            if not html_ok and head_of(tmp).lstrip()[:15].lower().startswith((b"<!doctype html", b"<html")):
+                tmp.unlink()
+                vlog(f"skip (html body) {url} <- {src}")
+                return {**base, "status": "skipped-html", "files": []}
             name = info["hint"] or safe_name(unquote(Path(urlsplit(url).path).name)) or "file"
             name = with_ext(name, head_of(tmp), ct, url)
             first = placer.claim(dirs[0] / name, url)
@@ -515,11 +525,26 @@ def oauth(client_id, client_secret, redirect):
 
 # ---------------------------------------------------------------- per-account fetch
 
+class LinkJob:
+    """A link to save as a shortcut next to an unlock's file (decided after downloads finish)."""
+
+    def __init__(self, url, stem, owner, origin, mode):
+        self.url, self.stem, self.owner, self.origin, self.mode = url, stem, owner, origin, mode
+
+
+def write_link(path, url, fmt):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "url":  # Windows Internet Shortcut; plain text elsewhere
+        path.write_text(f"[InternetShortcut]\r\nURL={url}\r\n", encoding="utf-8")
+    else:
+        path.write_text(url + "\n", encoding="utf-8")
+
+
 POST_RE = re.compile(r"^https?://(?:www\.)?toneden\.io/([^/?#]+)/post/([^/?#]+)", re.I)
 UNLOCK_SECT = "Campaigns Interacted With (Gate Unlocks)"
 
 
-def unlock_campaigns(api, ia, adir, sources, with_assets):
+def unlock_campaigns(api, ia, adir, sources, with_assets, link_mode="fallback"):
     """Campaigns this account unlocked (other people's attachments): campaign URL ->
     /posts?author_username&link_path -> post.unlock.id -> /attachments/{id}/gateMetadata.
     The viewer must be the account that completed the gate, else is_gate_open is false and there
@@ -573,14 +598,27 @@ def unlock_campaigns(api, ia, adir, sources, with_assets):
                "post.unlock.artwork_url": unlock.get("artwork_url"),
                "post.unlock.preview_url": unlock.get("preview_url")}
         sources.append(("unlocked", owner, "api_posts", art))
-        if dl:
+        # download target: gateMetadata's download_url; for link-type unlocks with an open gate
+        # fall back to the post's direct_url
+        origin = "api_gate_metadata+api_posts(name)"
+        target = dl
+        if not target and md.get("is_gate_open"):
+            target = unlock.get("direct_url") or post.get("direct_url")
+            origin = "api_posts.direct_url"
+        if target:
             # filename lives only in the posts response (download_display_url), not in gateMetadata
             name = unlock.get("download_display_url") or post.get("download_display_url")
-            sources.append(("unlocked", owner, "api_gate_metadata+api_posts(name)",
-                            {"download_url": dl, "download_display_url": name}))
+            sources.append(("unlocked", owner, origin, {"download_url": target, "download_display_url": name}))
+            if link_mode != "never":
+                stem = name or post.get("link_path") or path or str(aid)
+                if Path(stem).suffix.lower() in KNOWN_EXT:
+                    stem = Path(stem).stem
+                sources.append(("unlocked", owner, origin,
+                                LinkJob(target, safe_name(stem) or str(aid), owner, origin, link_mode)))
 
 
-def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_assets=True):
+def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_assets=True,
+                link_mode="fallback"):
     """Fetch everything for one account. Returns [(kind, id, origin, obj)] or None on auth failure."""
     ia = acct.get("Interactions & Activity", {})
     sources = list(export_sources(acct, uid))
@@ -645,7 +683,7 @@ def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_a
             grab(f"attachments/{i}/unlocks_platforms", f"/attachments/{i}/unlocks/platforms", owner=o)
 
     # campaigns this account unlocked
-    unlock_campaigns(api, ia, adir, sources, unlock_assets)
+    unlock_campaigns(api, ia, adir, sources, unlock_assets, link_mode)
 
     # audience fans (unofficial site endpoint; may not accept OAuth tokens). Contains third-party
     # personal data. Saved as JSON only: fan avatars etc. are not downloaded.
@@ -748,6 +786,13 @@ def main():
     ap.add_argument("--no-unlock-assets", action="store_true",
                     help="don't download assets of campaigns this account unlocked (their posts/"
                          "gateMetadata JSON is still saved)")
+    ap.add_argument("--unlock-links", choices=("fallback", "always", "never"), default="fallback",
+                    help="link shortcut for each unlocked campaign's download target:\n"
+                         "  fallback (default): only when it can't be saved as a file (HTML page, error)\n"
+                         "  always: also next to files that were saved\n"
+                         "  never: no shortcuts")
+    ap.add_argument("--link-format", choices=("url", "txt"), default="url",
+                    help="shortcut file type: .url (Internet Shortcut) or .txt containing the URL")
     ap.add_argument("--no-fans", action="store_true",
                     help="skip /users/{id}/audience/fans (unofficial; third-party personal data)")
     ap.add_argument("--api-base", default=API)
@@ -797,7 +842,7 @@ def main():
             continue
         log(f"account {uid}")
         res = run_account(Api(a.api_base, cred), acct, uid,
-                          out / "accounts" / str(uid) / "api", a.playbook_id, metrics, not a.no_fans, not a.no_unlock_assets)
+                          out / "accounts" / str(uid) / "api", a.playbook_id, metrics, not a.no_fans, not a.no_unlock_assets, a.unlock_links)
         if res is not None:
             sources += res
             done += 1
@@ -817,13 +862,16 @@ def main():
         vlog(f"  found {u} <- " + ", ".join(f"{k}/{i}:{o}[{f}]" for (k, i), of in sorted(t["dests"].items())
                                           for o, f in sorted(of)))
 
-    manifest = []
+    manifest, link_recs, prior_links = [], [], []
     if not a.no_download and targets:
         prior, claims = {}, {}
         mp = out / "manifest.json"
         if mp.exists():
             try:
                 for rec in json.loads(mp.read_text()):
+                    if rec.get("kind") == "link":
+                        prior_links.append(rec)
+                        continue
                     prior[rec["url"]] = rec
                     for f in rec.get("files", []):
                         claims[str(out / f)] = rec["url"]
@@ -838,7 +886,29 @@ def main():
                     log(f"  {rec['status']} {rec['url']} <- {src_str(rec['sources'])}")
                 elif not VERBOSE and n % 25 == 0:
                     log(f"  downloaded {n}/{len(items)}")
-        dump(mp, manifest)
+        by_url = {r["url"]: r for r in manifest}
+        for j in (o for _, _, _, o in sources if isinstance(o, LinkJob)):
+            rec = by_url.get(j.url)
+            resolved = rec is not None and rec["status"] in (200, "cached")
+            if resolved and j.mode != "always":
+                vlog(f"  link shortcut not needed (saved as file) {j.url} <- {j.owner}:{j.origin}")
+                continue
+            reason = "always" if resolved else f"unresolved:{rec['status'] if rec else 'not-attempted'}"
+            path = out / "assets" / "unlocked" / j.owner / (j.stem + "." + a.link_format)
+            write_link(path, j.url, a.link_format)
+            link_recs.append({"kind": "link", "link_url": j.url, "reason": reason,
+                              "files": [str(path.relative_to(out))],
+                              "sources": [{"kind": "unlocked", "id": j.owner, "origin": j.origin,
+                                           "field": "download_url"}]})
+            log(f"  link shortcut ({reason}): {path.relative_to(out)} <- unlocked/{j.owner}:{j.origin}")
+        keep = {f for r in link_recs for f in r["files"]}
+        for r in prior_links:  # shortcuts from earlier runs that are no longer wanted
+            for f in r.get("files", []):
+                fp = out / f
+                if f not in keep and fp.exists() and (out / "assets") in fp.parents:
+                    fp.unlink()
+                    vlog(f"removed superseded link shortcut {f}")
+        dump(mp, manifest + link_recs)
     ok = sum(r["status"] in (200, "cached") for r in manifest)
     log(f"done: {done} accounts, {ok}/{len(targets)} assets -> {out} (see accounts/*/api/_errors.json, run.log)")
 
