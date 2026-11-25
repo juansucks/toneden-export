@@ -67,6 +67,8 @@ python toneden_export.py export.json --token-map '{"2420976": "s%3A...", "123": 
 python toneden_export.py ToneDen_Privacy_Data.json -o out/ -v
 ```
 
+The export file is optional. Without it the account is taken from the credential and only data the API can give is fetched (add `--saves` and/or `--downloads-tsv` to get unlocked/saved campaigns).
+
 | Option | Description |
 |---|---|
 | `-o, --out DIR` | Output directory (default `toneden_export`). |
@@ -76,6 +78,10 @@ python toneden_export.py ToneDen_Privacy_Data.json -o out/ -v
 | `--only UID` | Process only this user ID (repeatable). |
 | `--playbook-id ID` | Fetch a playbook campaign (repeatable). Playbook IDs cannot be derived from the export. |
 | `--link-metrics a,b,c` | `metric` values to try on `/links/{id}/insights` (default `clicks,clickthroughs,email_clicks,rsvps`). |
+| `--downloads-tsv FILE` | Campaigns from a `toneden_unlock.py --downloads-out` file (`post_url`, `download_url`, `filename`). The download URL and filename in the file are used directly; the posts API supplies the gate ID, poster and artwork. Filed like other unlocks. Rows go to the first account, or `--tsv-user UID`. |
+| `--saves` | Also list the account's saved posts through the API and process them like unlocked campaigns. The listing endpoint is undocumented, see below. |
+| `--saves-endpoint PATH` | Saved-posts listing to use instead of the built-in guesses: a path with `{uid}` and optional `?query`, repeatable. |
+| `--delay SECONDS` | Pause between per-campaign API requests (default 0.25). |
 | `--no-unlock-assets` | Don't download assets or write link shortcuts for campaigns you unlocked. Their post and gateMetadata JSON is still saved. |
 | `--unlock-links MODE` | Link shortcut for each unlocked campaign's download target. `fallback` (default): only when it can't be saved as a file (it is an HTML page, or the request fails). `always`: also next to files that were saved. `never`: none. |
 | `--link-format FMT` | Shortcut type: `url` (default, an Internet Shortcut file) or `txt` (the URL as text). |
@@ -100,7 +106,7 @@ out/
     audience_fans.json
     links_list.json, links/<id>/     link, insights_<metric>, insights_overview
     campaigns_list.json, campaigns/<id>/
-    unlocked/<poster>/<unlock id>/   post.json, gate_metadata.json
+    unlocked/<poster>/<link_path> [<id>]/   post.json, gate_metadata.json
     _insight_metrics.json            which link metrics were accepted
     _errors.json                     non-200 responses
   assets/
@@ -108,9 +114,20 @@ out/
     links/<id>/<file>
     campaigns/<id>/<file>
     account/<uid>/<file>
-    unlocked/<poster>/<unlock id>/<file>   other creators' campaigns you unlocked
-    unlocked/<poster>/<unlock id>/<name>.url|.txt   link shortcut, see below
+    unlocked/<poster>/<link_path> [<id>]/<file>   other creators' campaigns you unlocked
+    unlocked/<poster>/<link_path> [<id>]/<name>.url|.txt   link shortcut, see below
 ```
+
+Unlocked and saved campaigns:
+
+- Campaign URLs come from the export's `Campaigns Interacted With (Gate Unlocks)` and `Saved Tracks & Presaves` sections, `--downloads-tsv` rows and `--saves`. Duplicates across sources are merged.
+- Each is looked up with `/posts?author_username=&link_path=`. The gate's attachment ID is `post.id` (what the site's own unlock calls use), with `post.unlock.id` tried too if it differs. Posts without a `post.unlock` object are handled.
+- Files go to `assets/unlocked/<poster>/<link_path> [<id>]/`. The poster is the post's `author.username` (not whatever appeared in the URL, so one author always lands in one folder), `link_path` is the post's slug, and `<id>` is the gate ID; the square brackets are literal, e.g. `assets/unlocked/korisound/gemi-kori-vesta [6085494]/`. Both names are URL-decoded and every character other than letters, digits, `_ - . ~ ( )` and spaces is replaced with `_`.
+- Posts already fetched are cached (`api/unlocked/_index.json` plus `post.json`) and not requested again on reruns; `gateMetadata` is requested again unless a TSV row already has the download URL. Failures are listed in `api/unlocked/_failed.json`.
+- Folders from earlier layouts (`unlocked/<id>/`, `unlocked/<poster>/<id>/`) are moved when the same campaign is processed again, and emptied folders are removed. Any that remain are reported at the end of the run (they weren't matched by this run, for example with `--no-download`).
+- `-v` / `run.log` print `-> unlocked/<poster>/<link_path> [<id>]` for every campaign, with where it came from.
+
+Saved posts (`--saves`): `/users/socialStats` reports a saves count, but the listing endpoint isn't known. The script tries `/users/{uid}/saves`, `/users/{uid}/saves?type=unlock`, `/users/{uid}/saved` and `/users/{uid}/savedPosts`, paging with the largest `limit` the server accepts, and uses the first that returns items. What each one returned (status, response shape, item count) is written to `api/_saves_probe.json`, and the listed count is compared with `socialStats`. If it comes back empty, open the site's saved-posts page with the browser dev tools Network tab open, copy the request path and query, and pass it with `--saves-endpoint`. Saved posts can only be downloaded if the gate is open for that account.
 
 Unlocked campaign links:
 
@@ -145,6 +162,8 @@ Unofficial (found via the site, may change or reject OAuth): `/attachments/{id}/
 - The per-attachment fan filter for contests (`contest_entered`) and `offset`/`limit` pagination on the fans endpoint are unverified. If the server ignores pagination, only the first page is saved.
 - Playbook IDs aren't in the export; pass them with `--playbook-id`.
 - Private posts with a secret token in the URL aren't handled.
+- The saved-posts listing endpoint is unknown; `--saves` only works if one of the guessed or supplied endpoints returns items.
+- Download URLs from a TSV may be signed or expire; `api.soundcloud.com/.../download` and share-page links (Drive, Mediafire) usually can't be fetched as files and fall back to link shortcuts.
 - Using `direct_url` for link-type unlocks is an assumption about the API's fields; it is only used when the gate is open and `download_url` is missing.
 - Facebook ad video creatives only expose a `video_id`, so those videos can't be downloaded.
 - Comments, submissions, follows and the other activity sections have no API endpoints; they remain only in `export.json`.
