@@ -5,6 +5,10 @@
   TONEDEN_COOKIE=<connect.sid value> python toneden_export.py export.json -o out/   # unofficial
   TONEDEN_CLIENT_ID=.. TONEDEN_CLIENT_SECRET=.. python toneden_export.py export.json --oauth
 
+The export is optional: without it the account comes from the credential and only API-sourced
+data is fetched. Extra campaign sources: --downloads-tsv (toneden_unlock.py --downloads-out file)
+and --saves (saved posts via the API); the export's "Saved Tracks & Presaves" section is always used.
+
 Accepts both export layouts: single account (root has "Personal Data") and multi-account
 (root has "Accounts": {id: {...}}). A token/cookie only reaches the account that authorized it
 (plus what it manages); use --token-map '{"<userID>": "<token or connect.sid=...>"}' for
@@ -16,10 +20,13 @@ Output:
   out/accounts/<uid>/api/...                   raw JSON per endpoint; _errors.json = non-200 responses
         incl. unofficial site endpoints: attachments/<id>/gate_metadata.json (gateMetadata),
         audience_fans.json and attachments/<id>/fans.json (audience/fans?filters=...)
-        unlocked/<user>/<unlock id>/post.json + gate_metadata.json (campaigns this account unlocked)
+        unlocked/<poster>/<link_path> [<id>]/post.json + gate_metadata.json (campaigns this account
+        unlocked/saved; poster username = the post's author.username), unlocked/_index.json
+        (resume cache: posts already fetched are not requested again), unlocked/_failed.json,
+        _saves_probe.json (what each saved-posts endpoint returned), social_stats.json
   out/assets/<kind>/<id>/<file>                downloaded assets, e.g.
         assets/attachments/12345/art.png       assets/links/678/bg.jpg
-        assets/account/<uid>/avatar.jpg        assets/unlocked/<user>/<unlock id>/<download_display_url>
+        assets/account/<uid>/avatar.jpg        assets/unlocked/<poster>/<link_path> [<id>]/<download_display_url>
       (unlocked = other creators' campaigns this account unlocked, kept apart from own attachments)
       Unlocked campaigns whose download target isn't a file (HTML page, error) get a link shortcut
       (<name>.url or .txt, see --unlock-links / --link-format) in the same folder; "always" also
@@ -33,6 +40,7 @@ Output:
 Requires: requests
 """
 import argparse
+import csv
 import hashlib
 import http.server
 import json
@@ -47,14 +55,14 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 import requests
 
 API = "https://www.toneden.io/api/v1"
 AUTH_URL = "https://www.toneden.io/auth/oauth2/authorize"
 TOKEN_URL = "https://www.toneden.io/auth/oauth2/token"
-UA = "toneden-export/1.2"
+UA = "toneden-export/1.3"
 
 # /links/{id}/insights requires a `metric` param; its allowed values aren't in the public docs
 # ("rsvps" is livestream-only). Candidates are probed; metrics that never succeed get dropped.
@@ -117,7 +125,8 @@ def as_list(data):
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
-        for k in ("attachments", "links", "campaigns", "userLists", "fans", "data", "results", "items"):
+        for k in ("attachments", "links", "campaigns", "userLists", "fans", "saves", "following", "posts", "data", "results",
+                  "items"):
             if isinstance(data.get(k), list):
                 return data[k]
         for v in data.values():
@@ -140,6 +149,18 @@ def safe_name(s, n=150):
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", s).strip(" .")[:n]
 
 
+def folder_part(s, n=100):
+    """One path component: URL-decoded, anything but letters/digits/_-.~ ()  replaced by _
+    (so no slashes, brackets or reserved characters)."""
+    s = str(s)
+    for _ in range(3):  # decode (also double-encoded values) until stable
+        d = unquote(s)
+        if d == s:
+            break
+        s = d
+    return re.sub(r"[^\w\-.~ ()]+", "_", s).strip(" .")[:n].strip(" .") or "_"
+
+
 class Api:
     def __init__(self, base, cred):
         self.base = base.rstrip("/")
@@ -151,10 +172,10 @@ class Api:
             self.s.headers["Authorization"] = f"Bearer {cred}"
         self.errors = []
 
-    def get(self, path, params=None, probe=False):
+    def get(self, path, params=None, probe=False, tries=6):
         """probe=True: a 400 is an expected answer (not recorded in errors)."""
         last = None
-        for n in range(6):
+        for n in range(tries):
             t0 = time.time()
             try:
                 r = self.s.get(self.base + path, params=params, timeout=30, allow_redirects=False)
@@ -171,7 +192,7 @@ class Api:
                 except ValueError:
                     wait = 2 ** n
                 last = {"path": path, "params": params, "status": r.status_code, "body": r.text[:500]}
-                log(f"  {r.status_code} on {path}; waiting {min(wait, 120):.0f}s (try {n + 1}/6)")
+                log(f"  {r.status_code} on {path}; waiting {min(wait, 120):.0f}s (try {n + 1}/{tries})")
                 time.sleep(min(wait, 120))
                 continue
             try:
@@ -185,19 +206,26 @@ class Api:
                 self.errors.append({"path": path, "params": params, "status": r.status_code, "body": data})
             return r.status_code, data
         self.errors.append(last)
-        return 0, None
+        return (last or {}).get("status", 0), None
 
-    def paginate(self, path, params=None, limits=(100, 25, None), max_pages=10000):
-        # limit's max is undocumented: fall back to smaller/no limit if the first page 400s
+    def paginate(self, path, params=None, limits=(1000, 600, 100, 25, None), max_pages=100000):
+        """limit's max is undocumented (the site accepted 1000): if the first page is rejected
+        (400/413/422, 5xx, no response) retry with the next smaller limit, finally with none.
+        `offset` is only sent from page 2 on; it advances by the items actually received."""
         for limit in limits:
+            last_try = limit == limits[-1]
             out, seen, offset = [], set(), 0
             for _ in range(max_pages):
-                q = {**(params or {}), "offset": offset}
+                q = dict(params or {})
                 if limit:
                     q["limit"] = limit
-                st, data = self.get(path, q)
-                if st == 400 and offset == 0 and limit != limits[-1]:
-                    self.errors.pop()
+                if offset:
+                    q["offset"] = offset
+                st, data = self.get(path, q, tries=6 if (offset or last_try) else 2)
+                if not offset and not last_try and (st in (0, 400, 413, 422) or st >= 500):
+                    if self.errors and self.errors[-1]["status"] == st:
+                        self.errors.pop()
+                    vlog(f"  paginate {path}: limit={limit} rejected ({st}); trying a smaller one")
                     break
                 if st != 200:
                     return out
@@ -364,21 +392,42 @@ def with_ext(name, head, ct, url):
     return name + ext
 
 
+def file_sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def same_file(a, b):
+    try:
+        return a.stat().st_size == b.stat().st_size and file_sha(a) == file_sha(b)
+    except OSError:
+        return False
+
+
 class Placer:
-    """Chooses collision-free filenames; one URL's name never overwrites another URL's file."""
+    """Chooses collision-free filenames; one URL's name never overwrites another URL's file.
+    An existing file that no manifest record owns (e.g. left by an interrupted run) is reused if
+    its content is identical to `content`, otherwise the next free name is used."""
 
     def __init__(self, prior_claims):
         self.claimed = dict(prior_claims)  # path str -> url
         self.lock = threading.Lock()
 
-    def claim(self, path, url):
+    def claim(self, path, url, content=None):
+        h = hashlib.sha1(url.encode()).hexdigest()[:8]
+        alt = path.with_name(f"{path.stem}_{h}{path.suffix}")
+        cands = [path, alt] + [path.with_name(f"{path.stem}_{h}_{i}{path.suffix}") for i in range(2, 1000)]
         with self.lock:
-            for p in (path, path.with_name(f"{path.stem}_{hashlib.sha1(url.encode()).hexdigest()[:8]}{path.suffix}")):
+            for p in cands:
                 owner = self.claimed.get(str(p))
-                if owner == url or (owner is None and not p.exists()):
+                if owner == url or (owner is None and (not p.exists() or
+                                                      (content is not None and same_file(p, content)))):
                     self.claimed[str(p)] = url
                     return p
-            return None
+        raise RuntimeError(f"no free filename for {path}")
 
 
 def link_or_copy(src, dst):
@@ -421,7 +470,7 @@ def fetch_asset(url, info, out, placer, prior):
             name = with_ext(prev.name, head_of(prev), rec.get("content_type") or "", url)
             files = []
             for d in dirs:
-                p = placer.claim(d / name, url)
+                p = placer.claim(d / name, url, prev)
                 link_or_copy(prev, p)
                 files.append(p)
             for f in old:  # drop this tool's own superseded files (old layout / no extension)
@@ -443,6 +492,7 @@ def fetch_asset(url, info, out, placer, prior):
     if not info["strong"] and PAGE_HOSTS.search(urlsplit(url).hostname or ""):
         vlog(f"skip (page host) {url} <- {src}")
         return {**base, "status": "skipped-page-host", "files": []}
+    last_err = None
     for n in range(4):
         try:
             # plain requests.get: credentials must never be sent to third-party hosts
@@ -475,20 +525,25 @@ def fetch_asset(url, info, out, placer, prior):
                 return {**base, "status": "skipped-html", "files": []}
             name = info["hint"] or safe_name(unquote(Path(urlsplit(url).path).name)) or "file"
             name = with_ext(name, head_of(tmp), ct, url)
-            first = placer.claim(dirs[0] / name, url)
+            first = placer.claim(dirs[0] / name, url, tmp)
             os.replace(tmp, first)
             files = [first]
             for d in dirs[1:]:
-                p = placer.claim(d / first.name, url)
+                p = placer.claim(d / first.name, url, first)
                 link_or_copy(first, p)
                 files.append(p)
             vlog(f"saved {url} -> {', '.join(str(p.relative_to(out)) for p in files)} ({size}B) <- {src}")
             return {**base, "status": 200, "files": [str(p.relative_to(out)) for p in files],
                     "bytes": size, "sha256": sha.hexdigest(), "content_type": ct}
         except requests.RequestException as e:
-            vlog(f"download error {url}: {e}; retry <- {src}")
+            msg = str(e)
+            if any(x in msg for x in ("NameResolutionError", "Failed to resolve", "getaddrinfo")):
+                vlog(f"dns failure, not retrying: {urlsplit(url).hostname} ({url}) <- {src}")
+                return {**base, "status": "dns-error", "files": [], "error": f"{type(e).__name__}"}
+            last_err = f"{type(e).__name__}: {msg[:200]}"
+            vlog(f"download error {url}: {type(e).__name__}; retry {n + 1}/4 <- {src}")
             time.sleep(2 ** n)
-    return {**base, "status": "error", "files": []}
+    return {**base, "status": "error", "files": [], "error": last_err}
 
 
 # ---------------------------------------------------------------- auth
@@ -541,84 +596,238 @@ def write_link(path, url, fmt):
 
 
 POST_RE = re.compile(r"^https?://(?:www\.)?toneden\.io/([^/?#]+)/post/([^/?#]+)", re.I)
-UNLOCK_SECT = "Campaigns Interacted With (Gate Unlocks)"
+UNLOCK_SECTS = ("Campaigns Interacted With (Gate Unlocks)", "Saved Tracks & Presaves")
 
 
-def unlock_campaigns(api, ia, adir, sources, with_assets, link_mode="fallback"):
-    """Campaigns this account unlocked (other people's attachments): campaign URL ->
-    /posts?author_username&link_path -> post.unlock.id -> /attachments/{id}/gateMetadata.
-    The viewer must be the account that completed the gate, else is_gate_open is false and there
-    is no download_url. Assets go to assets/unlocked/<user>/<unlock id>/, apart from own attachments."""
-    seen = {}
-    for n, it in enumerate(ia.get(UNLOCK_SECT) or []):
-        url = it.get("Campaign URL") if isinstance(it, dict) else None
-        src = f"export['Interactions & Activity'][{UNLOCK_SECT!r}][{n}]['Campaign URL']"
-        m = POST_RE.match(url or "")
-        if not m:
-            if url:
-                vlog(f"  unlock campaign skipped (not a toneden.io/<user>/post/<path> URL): {url} <- {src}")
-            continue
-        seen.setdefault((unquote(m[1]), unquote(m[2])), (url, src))
-    log(f"  {len(seen)} unlocked campaigns")
-    for k, ((user, path), (url, src)) in enumerate(seen.items(), 1):
-        vlog(f"  unlocked campaign {k}/{len(seen)}: {url} <- {src}")
-        st, data = api.get("/posts", {"author_username": user, "link_path": path})
-        if st != 200:
-            log(f"  {st} /posts {user}/{path} <- {src}")
-            continue
+def parse_tsv(path):
+    """toneden_unlock.py --downloads-out format: post_url<TAB>download_url<TAB>filename."""
+    rows = []
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for n, row in enumerate(csv.reader(f, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
+            if n == 1 and row and row[0].strip().lower() == "post_url":
+                continue
+            if len(row) >= 2 and row[0].strip():
+                rows.append((n, row[0].strip(), row[1].strip(), row[2].strip() if len(row) > 2 else ""))
+    return rows
+
+
+def add_entry(entries, url, src, download_url=None, filename=None):
+    """Register a campaign (toneden.io/<user>/post/<slug>); sources and TSV data are merged."""
+    m = POST_RE.match(url or "")
+    if not m:
+        if url:
+            vlog(f"  not a toneden.io/<user>/post/<slug> URL, skipped: {url} <- {src}")
+        return False
+    user, slug = unquote(m[1]), unquote(m[2])
+    e = entries.setdefault((user.lower(), slug), {"user": user, "slug": slug, "url": url, "srcs": [],
+                                                  "download_url": None, "filename": None})
+    e["srcs"].append(src)
+    e["download_url"] = e["download_url"] or download_url or None
+    e["filename"] = e["filename"] or filename or None
+    return True
+
+
+def saved_post_url(item):
+    """Post URL from a saved-post list item (an attachment object, possibly wrapped)."""
+    it = unwrap(item)
+    if not isinstance(it, dict):
+        return None
+    for k in ("url", "post_url", "campaign_url", "page_url"):
+        if isinstance(it.get(k), str) and POST_RE.match(it[k]):
+            return it[k]
+    name = (it.get("owner") or it.get("author") or {}).get("username") or it.get("username")
+    if name and it.get("link_path"):
+        url = f"https://www.toneden.io/{quote(name, safe='')}/post/{quote(it['link_path'], safe='-_.~')}"
+        if it.get("is_private") and it.get("secret_token"):
+            url += "/" + it["secret_token"]
+        return url
+    return None
+
+
+def find_key(o, key):
+    if isinstance(o, dict):
+        if key in o and isinstance(o[key], (int, float)):
+            return o[key]
+        for v in o.values():
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(o, list):
+        for v in o:
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def shape(d):
+    if isinstance(d, list):
+        return f"list[{len(d)}]"
+    if isinstance(d, dict):
+        return {k: (f"list[{len(v)}]" if isinstance(v, list) else type(v).__name__) for k, v in d.items()}
+    return type(d).__name__
+
+
+SAVES_CANDIDATES = ["/users/{uid}/saves", "/users/{uid}/saves?type=unlock", "/users/{uid}/saved",
+                    "/users/{uid}/savedPosts"]
+
+
+def fetch_saves(api, uid, adir, endpoints):
+    """Saved posts via the API. The listing endpoint isn't documented: `endpoints` (paths with
+    {uid}, optional ?query) or SAVES_CANDIDATES are tried in order and the first non-empty one
+    wins. What every candidate returned goes to _saves_probe.json."""
+    st, stats = api.get("/users/socialStats", probe=True)
+    expected = find_key(stats, "saves") if st == 200 else None
+    if st == 200:
+        dump(adir / "social_stats.json", stats)
+    probe, items = [], []
+    for ep in endpoints or SAVES_CANDIDATES:
+        path, _, qs = ep.format(uid=uid).partition("?")
+        params = dict(x.split("=", 1) for x in qs.split("&") if "=" in x)
+        raw_st, raw = api.get(path, {**params, "limit": 25}, probe=True)  # shape of a plain call
+        got = api.paginate(path, params)
+        probe.append({"endpoint": ep, "status": raw_st, "shape": shape(raw), "items": len(got)})
+        vlog(f"  saves probe {ep}: status {raw_st}, {shape(raw)}, {len(got)} items")
+        if got:
+            items = got
+            break
+    dump(adir / "_saves_probe.json", {"socialStats.saves": expected, "tried": probe})
+    log(f"  saved posts: {len(items)} listed" + (f" (socialStats says {expected})" if expected is not None else ""))
+    if items:
+        dump(adir / "saves.json", items)
+    elif expected:
+        log(f"  ! socialStats reports {expected} saves but no listing endpoint returned any; see "
+            "_saves_probe.json. Find the request the site's Saved page makes (browser dev tools, Network) "
+            "and pass it with --saves-endpoint '/users/{uid}/...?...'")
+    return items
+
+
+def unlock_campaigns(api, entries, adir, sources, with_assets, link_mode="fallback", delay=0.25):
+    """Campaigns this account unlocked or saved (other people's posts).
+
+    Per campaign: /posts?author_username&link_path -> post (id = gate attachment id; post.unlock
+    may carry the display name) -> /attachments/{id}/gateMetadata for the download_url, unless
+    a TSV row already supplied one. The viewer must be the account that completed the gate, else
+    is_gate_open is false and there is no download_url. Everything is filed as
+    unlocked/<poster>/<link_path> [<id>]/ (poster = the post's author.username, id = gate id).
+    Posts already fetched (api/unlocked/_index.json + post.json) are not requested again."""
+    udir = adir / "unlocked"
+    ipath = udir / "_index.json"
+    try:
+        index = json.loads(ipath.read_text()) if ipath.exists() else {}
+    except ValueError:
+        index = {}
+    failed, total = [], len(entries)
+    log(f"  {total} campaigns to process (unlocked / saved / tsv)")
+    for k, (key, e) in enumerate(entries.items(), 1):
+        src = "; ".join(e["srcs"][:3]) + (f" (+{len(e['srcs']) - 3} more)" if len(e["srcs"]) > 3 else "")
+        if k % 25 == 0 or k == total:
+            log(f"  campaign {k}/{total}")
+        vlog(f"  campaign {k}/{total}: {e['url']} <- {src}")
+
+        def fail(why):
+            log(f"  ! {why}: {e['url']} <- {src}")
+            failed.append({"url": e["url"], "reason": why, "sources": e["srcs"]})
+
+        ikey = f"{key[0]}/{key[1]}"
+        data = None
+        ent = index.get(ikey)
+        if ent and (udir / ent["dir"] / "post.json").exists():
+            try:
+                data = json.loads((udir / ent["dir"] / "post.json").read_text())
+                vlog(f"    post from cache {ent['dir']}/post.json")
+            except ValueError:
+                data = None
+        fresh = data is None
+        if fresh:
+            st, data = api.get("/posts", {"author_username": e["user"], "link_path": e["slug"]})
+            time.sleep(delay)
+            if st != 200:
+                fail(f"/posts {st}")
+                continue
         post = (data.get("post") if isinstance(data, dict) else None) or {}
         unlock = post.get("unlock") or {}
-        aid = unlock.get("id")
-        if aid is None:
-            log(f"  no post.unlock.id for {url} <- {src}")
+        # the gate's attachment id: post.id (what the site's own unlock calls use) or post.unlock.id
+        ids = []
+        for i in (post.get("id"), unlock.get("id")):
+            if i is not None and i not in ids:
+                ids.append(i)
+        if not ids:
+            fail("no post.id / post.unlock.id")
             continue
-        uname = safe_name(user) or "unknown"
-        d = adir / "unlocked" / uname / str(aid)
-        old_d = adir / "unlocked" / str(aid)  # earlier layout: unlocked/<id>
-        if old_d.is_dir() and not d.exists():
-            d.parent.mkdir(parents=True, exist_ok=True)
-            old_d.rename(d)
-        owner = f"{uname}/{aid}"  # assets/unlocked/<user>/<unlock id>/
-        dump(d / "post.json", data)
-        st, gm = api.get(f"/attachments/{aid}/gateMetadata")
-        if st != 200:
-            log(f"  {st} /attachments/{aid}/gateMetadata ({url}) <- {src}")
-            continue
-        dump(d / "gate_metadata.json", gm)
-        md = (gm.get("metadata") if isinstance(gm, dict) else None) or {}
-        dl = md.get("download_url")
-        if not dl:
-            log(f"  {url}: no download_url (is_gate_open={md.get('is_gate_open')}, "
+        if len(ids) > 1:
+            vlog(f"    post.id {ids[0]} != post.unlock.id {ids[1]}; trying both")
+
+        md, gm, aid = {}, None, ids[0]
+        if not e["download_url"]:  # a TSV row already knows the download URL
+            for cand in ids:
+                st, g = api.get(f"/attachments/{cand}/gateMetadata")
+                time.sleep(delay)
+                if st == 200:
+                    gm, aid = g, cand
+                    md = (g.get("metadata") if isinstance(g, dict) else None) or {}
+                    break
+            if gm is None:
+                fail("gateMetadata failed")
+                continue
+
+        poster = (post.get("author") or {}).get("username") or e["user"]
+        uname = folder_part(poster)
+        rel = f"{uname}/{folder_part(post.get('link_path') or e['slug'])} [{aid}]"
+        d = udir / rel
+        vlog(f"    -> unlocked/{rel}")
+        olds = [udir / ent["dir"]] if ent else []  # earlier layouts: this entry's recorded folder,
+        olds += [udir / str(aid), udir / folder_part(e["user"]) / str(aid), udir / uname / str(aid)]
+        for old_d in olds:
+            if old_d != d and old_d.is_dir() and not d.exists():
+                d.parent.mkdir(parents=True, exist_ok=True)
+                old_d.rename(d)
+                vlog(f"    moved {old_d.relative_to(udir)} -> {rel}")
+                break
+        if fresh:
+            dump(d / "post.json", data)
+        if gm is not None:
+            dump(d / "gate_metadata.json", gm)
+        index[ikey] = {"dir": rel, "aid": aid, "post_id": post.get("id"), "url": e["url"]}
+        if k % 100 == 0:
+            dump(ipath, index)
+
+        dl = e["download_url"] or md.get("download_url")
+        origin = "tsv" if e["download_url"] else "api_gate_metadata+api_posts(name)"
+        if not dl and md.get("is_gate_open"):
+            dl = unlock.get("direct_url") or post.get("direct_url")
+            origin = "api_posts.direct_url"
+        if not dl and gm is not None:
+            log(f"  {e['url']}: no download_url (is_gate_open={md.get('is_gate_open')}, "
                 f"viewer_id={gm.get('viewer_id') if isinstance(gm, dict) else None})")
         if not with_assets:
-            vlog(f"  unlock assets skipped (--no-unlock-assets) for {aid}")
             continue
         # only the campaign's own media; not author/collaborator avatars
-        art = {"post.artwork_url": post.get("artwork_url"),
-               "post.unlock.artwork_url": unlock.get("artwork_url"),
-               "post.unlock.preview_url": unlock.get("preview_url")}
-        sources.append(("unlocked", owner, "api_posts", art))
-        # download target: gateMetadata's download_url; for link-type unlocks with an open gate
-        # fall back to the post's direct_url
-        origin = "api_gate_metadata+api_posts(name)"
-        target = dl
-        if not target and md.get("is_gate_open"):
-            target = unlock.get("direct_url") or post.get("direct_url")
-            origin = "api_posts.direct_url"
-        if target:
-            # filename lives only in the posts response (download_display_url), not in gateMetadata
-            name = unlock.get("download_display_url") or post.get("download_display_url")
-            sources.append(("unlocked", owner, origin, {"download_url": target, "download_display_url": name}))
+        sources.append(("unlocked", rel, "api_posts",
+                        {"post.artwork_url": post.get("artwork_url"),
+                         "post.unlock.artwork_url": unlock.get("artwork_url"),
+                         "post.unlock.preview_url": unlock.get("preview_url")}))
+        if dl:
+            # name: TSV filename if it is a name, else the posts response's download_display_url
+            # (gateMetadata has none); a URL-shaped TSV filename is the last resort
+            fn = e["filename"]
+            fn_url = fn if fn and URL_RE.match(fn) else None
+            name = (None if fn_url else fn) or unlock.get("download_display_url") \
+                or post.get("download_display_url") or fn_url
+            sources.append(("unlocked", rel, origin, {"download_url": dl, "download_display_url": name}))
             if link_mode != "never":
-                stem = name or post.get("link_path") or path or str(aid)
+                stem = name_from(name) or folder_part(post.get("link_path") or e["slug"])
                 if Path(stem).suffix.lower() in KNOWN_EXT:
                     stem = Path(stem).stem
-                sources.append(("unlocked", owner, origin,
-                                LinkJob(target, safe_name(stem) or str(aid), owner, origin, link_mode)))
+                sources.append(("unlocked", rel, origin,
+                                LinkJob(dl, safe_name(stem) or str(aid), rel, origin, link_mode)))
+    dump(ipath, index)
+    dump(udir / "_failed.json", failed)
+    if failed:
+        log(f"  {len(failed)} campaigns failed (see {udir / '_failed.json'})")
 
 
-def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_assets=True,
-                link_mode="fallback"):
+def run_account(api, acct, uid, adir, a, metrics, tsv_rows=()):
     """Fetch everything for one account. Returns [(kind, id, origin, obj)] or None on auth failure."""
     ia = acct.get("Interactions & Activity", {})
     sources = list(export_sources(acct, uid))
@@ -682,12 +891,23 @@ def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_a
             grab(f"attachments/{i}/unlocks_totals", f"/attachments/{i}/unlocks/totals", owner=o)
             grab(f"attachments/{i}/unlocks_platforms", f"/attachments/{i}/unlocks/platforms", owner=o)
 
-    # campaigns this account unlocked
-    unlock_campaigns(api, ia, adir, sources, unlock_assets, link_mode)
+    # campaigns this account unlocked / saved (export sections, TSV rows, saved-posts API)
+    entries = {}
+    for sect in UNLOCK_SECTS:
+        for n, it in enumerate(ia.get(sect) or []):
+            if isinstance(it, dict):
+                add_entry(entries, it.get("Campaign URL"),
+                          f"export[{sect!r}][{n}]['Campaign URL']")
+    for ln, url, dl, fn in tsv_rows:
+        add_entry(entries, url, f"tsv:{Path(a.downloads_tsv).name}:{ln}", dl, fn)
+    if a.saves:
+        for n, it in enumerate(fetch_saves(api, uid, adir, a.saves_endpoint)):
+            add_entry(entries, saved_post_url(it), f"api saves[{n}]")
+    unlock_campaigns(api, entries, adir, sources, not a.no_unlock_assets, a.unlock_links, a.delay)
 
     # audience fans (unofficial site endpoint; may not accept OAuth tokens). Contains third-party
     # personal data. Saved as JSON only: fan avatars etc. are not downloaded.
-    if fans:
+    if not a.no_fans:
         def fan_list(rel, filters=None):
             params = {"filters": json.dumps(filters, separators=(",", ":"))} if filters else None
             items = api.paginate(f"/users/{uid}/audience/fans", params)
@@ -753,7 +973,7 @@ def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_a
     sources.append(("account", uid, "api_userlists", lists))
 
     # playbooks (IDs only from the export's own entries or --playbook-id)
-    pb = {iid(x) for x in ia.get("Playbooks You Created (Creator Accounts)") or []} | set(playbook_ids)
+    pb = {iid(x) for x in ia.get("Playbooks You Created (Creator Accounts)") or []} | set(a.playbook_id)
     pb.discard(None)
     for i in sorted(pb):
         grab(f"playbooks/{i}", f"/playbooks/campaigns/{i}", origin="api_playbook")
@@ -765,7 +985,9 @@ def run_account(api, acct, uid, adir, playbook_ids, metrics, fans=True, unlock_a
 def main():
     global VERBOSE, LOGF
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    ap.add_argument("export", help="ToneDen privacy export JSON (not the .schema)")
+    ap.add_argument("export", nargs="?",
+                    help="ToneDen privacy export JSON (not the .schema). Optional: without it the "
+                         "account is taken from the credential and only API-sourced data is fetched")
     ap.add_argument("-o", "--out", default="toneden_export")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log every request/download to stderr (run.log always has them)")
@@ -793,6 +1015,17 @@ def main():
                          "  never: no shortcuts")
     ap.add_argument("--link-format", choices=("url", "txt"), default="url",
                     help="shortcut file type: .url (Internet Shortcut) or .txt containing the URL")
+    ap.add_argument("--downloads-tsv", metavar="FILE",
+                    help="toneden_unlock.py --downloads-out file (post_url, download_url, filename): "
+                         "download these files, filed like other unlocks")
+    ap.add_argument("--tsv-user", type=int, help="user ID the TSV belongs to (default: first account)")
+    ap.add_argument("--saves", action="store_true",
+                    help="also list the account's saved posts through the API (endpoint undocumented, "
+                         "see --saves-endpoint) and process them like unlocked campaigns")
+    ap.add_argument("--saves-endpoint", action="append", default=[], metavar="PATH",
+                    help="saved-posts listing path, {uid} placeholder, optional ?query; repeatable")
+    ap.add_argument("--delay", type=float, default=0.25,
+                    help="seconds between per-campaign API requests (default 0.25)")
     ap.add_argument("--no-fans", action="store_true",
                     help="skip /users/{id}/audience/fans (unofficial; third-party personal data)")
     ap.add_argument("--api-base", default=API)
@@ -818,31 +1051,42 @@ def main():
     if not a.token and not tmap:
         sys.exit("No credential: set TONEDEN_TOKEN / TONEDEN_COOKIE, pass --token/--cookie/--token-map, or use --oauth")
 
-    export = json.loads(Path(a.export).read_text())
-    shutil.copyfile(a.export, out / "export.json")
+    if a.export:
+        export = json.loads(Path(a.export).read_text())
+        shutil.copyfile(a.export, out / "export.json")
+    else:
+        export = {}
+        log("no export file: account taken from the credential; export-only data is skipped")
+    tsv_rows = parse_tsv(a.downloads_tsv) if a.downloads_tsv else []
+    if a.downloads_tsv:
+        log(f"{len(tsv_rows)} rows in {a.downloads_tsv}")
     metrics = [m.strip() for m in a.link_metrics.split(",") if m.strip()]
 
     # single-account: root is the account; multi-account: root["Accounts"] = {key: account}
     if "Accounts" in export and isinstance(export["Accounts"], dict):
         accounts = list(export["Accounts"].items())
     else:
-        accounts = [(None, export)]
+        accounts = [(None, export)]  # single-account export, or none (account from credential)
 
     sources, done = [], 0
-    for key, acct in accounts:
+    for n, (key, acct) in enumerate(accounts):
         uid = acct.get("Personal Data", {}).get("id") or key
+        cred = tmap.get(str(uid)) or a.token
+        if not uid and cred:  # no export: ask the API who the credential belongs to
+            st, me = Api(a.api_base, cred).get("/users/me")
+            uid = iid(me) if st == 200 else None
         if not uid:
-            log(f"skip account {key}: no user ID")
+            log(f"skip account {key}: no user ID (pass an export, or a working credential)")
             continue
         if a.only and int(uid) not in a.only:
             continue
-        cred = tmap.get(str(uid)) or a.token
         if not cred:
             log(f"skip account {uid}: no credential")
             continue
         log(f"account {uid}")
+        mine = tsv_rows if (str(uid) == str(a.tsv_user) if a.tsv_user else n == 0) else []
         res = run_account(Api(a.api_base, cred), acct, uid,
-                          out / "accounts" / str(uid) / "api", a.playbook_id, metrics, not a.no_fans, not a.no_unlock_assets, a.unlock_links)
+                          out / "accounts" / str(uid) / "api", a, metrics, mine)
         if res is not None:
             sources += res
             done += 1
@@ -878,14 +1122,34 @@ def main():
             except (ValueError, KeyError):
                 pass
         placer = Placer(claims)
-        with ThreadPoolExecutor(a.workers) as ex:
-            items = sorted(targets.items())
-            for n, rec in enumerate(ex.map(lambda kv: fetch_asset(kv[0], kv[1], out, placer, prior), items), 1):
-                manifest.append(rec)
-                if rec["status"] not in (200, "cached"):
-                    log(f"  {rec['status']} {rec['url']} <- {src_str(rec['sources'])}")
-                elif not VERBOSE and n % 25 == 0:
-                    log(f"  downloaded {n}/{len(items)}")
+
+        def safe_fetch(kv):
+            try:
+                return fetch_asset(kv[0], kv[1], out, placer, prior)
+            except Exception as e:  # one bad asset must not abort the run
+                return {"url": kv[0], "status": f"exception:{type(e).__name__}", "files": [],
+                        "error": str(e)[:200],
+                        "sources": [{"kind": k, "id": i, "origin": o, "field": f}
+                                    for (k, i), of in sorted(kv[1]["dests"].items()) for o, f in sorted(of)]}
+
+        def flush():  # progress survives a crash/Ctrl-C: done records + untouched prior ones
+            done = {r["url"] for r in manifest}
+            dump(mp, manifest + [r for u, r in prior.items() if u not in done] + prior_links)
+
+        items = sorted(targets.items())
+        try:
+            with ThreadPoolExecutor(a.workers) as ex:
+                for n, rec in enumerate(ex.map(safe_fetch, items), 1):
+                    manifest.append(rec)
+                    if rec["status"] not in (200, "cached"):
+                        log(f"  {rec['status']} {rec['url']} <- {src_str(rec['sources'])}"
+                            + (f" ({rec['error']})" if rec.get("error") else ""))
+                    elif not VERBOSE and n % 25 == 0:
+                        log(f"  downloaded {n}/{len(items)}")
+                    if n % 100 == 0:
+                        flush()
+        finally:
+            flush()
         by_url = {r["url"]: r for r in manifest}
         for j in (o for _, _, _, o in sources if isinstance(o, LinkJob)):
             rec = by_url.get(j.url)
@@ -909,6 +1173,24 @@ def main():
                     fp.unlink()
                     vlog(f"removed superseded link shortcut {f}")
         dump(mp, manifest + link_recs)
+    for base in [out / "assets" / "unlocked"] + sorted((out / "accounts").glob("*/api/unlocked")):
+        if base.is_dir():  # drop folders emptied by moves/removals
+            for dp, _, _ in sorted(os.walk(base), key=lambda t: -len(t[0])):
+                if Path(dp) != base:
+                    try:
+                        Path(dp).rmdir()
+                    except OSError:
+                        pass
+        legacy = []
+        for x in (sorted(base.iterdir()) if base.is_dir() else []):
+            if x.is_dir() and x.name.isdigit():  # unlocked/<id>/
+                legacy.append(x.name)
+            elif x.is_dir():  # unlocked/<poster>/<id>/
+                legacy += [f"{x.name}/{y.name}" for y in sorted(x.iterdir()) if y.is_dir() and y.name.isdigit()]
+        if legacy:
+            log(f"  ! {len(legacy)} folder(s) of an old unlocked layout remain in {base} "
+                f"(e.g. {', '.join(legacy[:5])}): not matched by this run; the current layout is "
+                f"unlocked/<poster>/<link_path> [<id>]/")
     ok = sum(r["status"] in (200, "cached") for r in manifest)
     log(f"done: {done} accounts, {ok}/{len(targets)} assets -> {out} (see accounts/*/api/_errors.json, run.log)")
 
